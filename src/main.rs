@@ -10,7 +10,7 @@ use ratatui::{
     prelude::*,
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::{io::stdout, process::Command};
@@ -53,6 +53,7 @@ impl App {
             list_state: ListState::default(),
             input: String::new(),
             preview_content: Vec::new(),
+            preview_scroll: 0,
             should_quit: false,
             selected_change_id: None,
         };
@@ -129,7 +130,19 @@ impl App {
         };
 
         self.list_state.select(Some(new_index));
+        self.preview_scroll = 0; // Reset scroll when changing selection
         self.update_preview();
+    }
+
+    fn scroll_preview(&mut self, delta: i16) {
+        if delta > 0 {
+            self.preview_scroll = self.preview_scroll.saturating_add(delta as u16);
+        } else {
+            self.preview_scroll = self.preview_scroll.saturating_sub((-delta) as u16);
+        }
+        // Clamp to content length
+        let max_scroll = self.preview_content.len().saturating_sub(1) as u16;
+        self.preview_scroll = self.preview_scroll.min(max_scroll);
     }
 
     fn confirm_selection(&mut self) {
@@ -210,15 +223,24 @@ fn run_app(
                 KeyCode::Enter => {
                     app.confirm_selection();
                 }
-                KeyCode::Up | KeyCode::Char('k')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                // Navigation: Ctrl+j/k or Up/Down arrows
+                KeyCode::Up => {
                     app.move_selection(-1);
                 }
-                KeyCode::Down | KeyCode::Char('j')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Down => {
                     app.move_selection(1);
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.move_selection(-1);
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.move_selection(1);
+                }
+                KeyCode::Tab => {
+                    app.move_selection(1);
+                }
+                KeyCode::BackTab => {
+                    app.move_selection(-1);
                 }
                 KeyCode::PageUp => {
                     app.move_selection(-10);
@@ -226,6 +248,14 @@ fn run_app(
                 KeyCode::PageDown => {
                     app.move_selection(10);
                 }
+                // Preview scrolling with Ctrl+u/d
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_preview(-10);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_preview(10);
+                }
+                // Text input
                 KeyCode::Char(c) => {
                     app.input.push(c);
                     app.filter_entries();
@@ -246,6 +276,7 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3), // Input
             Constraint::Min(0),    // Main content
+            Constraint::Length(1), // Help line
         ])
         .split(f.area());
 
@@ -287,13 +318,19 @@ fn ui(f: &mut Frame, app: &App) {
 
     f.render_stateful_widget(list, main_chunks[0], &mut app.list_state.clone());
 
-    // Preview pane
+    // Preview pane with scrolling
     let preview = Paragraph::new(app.preview_content.clone())
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Preview (jj diff) "),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((app.preview_scroll, 0));
     f.render_widget(preview, main_chunks[1]);
+
+    // Help line
+    let help =
+        Paragraph::new(" Enter: select | Esc: quit | Tab/↑↓: navigate | Ctrl+u/d: scroll preview")
+            .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(help, chunks[2]);
 }
