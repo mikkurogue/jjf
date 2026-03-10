@@ -22,6 +22,9 @@ jjf              # Launch TUI
 jjf -d 10        # Show 10 ancestor revisions per bookmark (default: 5)
 jjf --debug      # Print tree without TUI
 ```
+## Preview
+
+<img width="1259" height="1363" alt="image" src="https://github.com/user-attachments/assets/dff8a88b-b918-4bec-8800-393806c6d91c" />
 
 ## Keybindings
 
