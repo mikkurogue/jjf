@@ -70,18 +70,17 @@ impl TreeItem {
     }
 
     /// Create a display line for this tree item
-    pub fn to_display_line(&self) -> Line<'static> {
+    pub fn to_display_line(&self, selected: bool) -> Line<'static> {
         match self {
             TreeItem::BookmarkHeader { name, expanded, .. } => {
                 let arrow = if *expanded { "▼" } else { "▶" };
+                let mut style = Style::default().fg(Color::Magenta);
+                if selected {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
                 Line::from(vec![
                     Span::styled(format!("{} ", arrow), Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        name.clone(),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(name.clone(), style),
                 ])
             }
             TreeItem::Revision { revision, .. } => {
@@ -96,9 +95,13 @@ impl TreeItem {
                     ));
                 }
 
-                // Add the colored display line spans
+                // Add the colored display line spans, with bold if selected
                 for span in revision.display_line.spans.iter() {
-                    spans.push(span.clone());
+                    let mut style = span.style;
+                    if selected {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    spans.push(Span::styled(span.content.clone(), style));
                 }
 
                 Line::from(spans)

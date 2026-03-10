@@ -1,16 +1,16 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    ExecutableCommand,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
 };
 use ratatui::{
-    Frame, Terminal,
     layout::{Constraint, Direction, Layout},
     prelude::*,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame, Terminal,
 };
 use std::{io::stdout, process::Command};
 
@@ -67,7 +67,7 @@ impl App {
             filtered_indices,
             list_state: ListState::default(),
             input: String::new(),
-            focus: Focus::Search,
+            focus: Focus::List,
             should_quit: false,
             action: None,
         };
@@ -425,29 +425,26 @@ fn ui(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let selected_idx = app.list_state.selected();
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
-        .map(|&idx| {
+        .enumerate()
+        .map(|(i, &idx)| {
             let item = &app.tree_items[idx];
-            ListItem::new(item.to_display_line())
+            let is_selected = selected_idx == Some(i);
+            ListItem::new(item.to_display_line(is_selected))
         })
         .collect();
 
     let list_title = format!(" Bookmarks ({}) ", app.bookmarks.len(),);
 
-    // Use underline instead of reverse for highlight
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(list_style)
                 .title(list_title),
-        )
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::UNDERLINED),
         )
         .highlight_symbol("› ");
 
