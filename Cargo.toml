@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
-frizbee = "0.8"
-ratatui = "0.29"
-crossterm = "0.28"
+frizbee = "0.8.3"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
 anyhow = "1.0"
-strip-ansi-escapes = "0.2"
+strip-ansi-escapes = "0.2.1"
