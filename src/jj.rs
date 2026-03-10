@@ -71,35 +71,50 @@ impl TreeItem {
 
     /// Create a display line for this tree item
     pub fn to_display_line(&self, selected: bool) -> Line<'static> {
+        // Very subtle background for selection (236 is a dark gray)
+        let sel_bg = Color::Indexed(236);
+
         match self {
             TreeItem::BookmarkHeader { name, expanded, .. } => {
                 let arrow = if *expanded { "▼" } else { "▶" };
+                let mut arrow_style = Style::default().fg(Color::DarkGray);
                 let mut style = Style::default().fg(Color::Magenta);
                 if selected {
-                    style = style.add_modifier(Modifier::BOLD);
+                    arrow_style = arrow_style.bg(sel_bg);
+                    style = style.bg(sel_bg);
                 }
                 Line::from(vec![
-                    Span::styled(format!("{} ", arrow), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{} ", arrow), arrow_style),
                     Span::styled(name.clone(), style),
                 ])
             }
             TreeItem::Revision { revision, .. } => {
-                let mut spans = vec![Span::raw("   ")]; // Indent
+                let bg = if selected { Some(sel_bg) } else { None };
+
+                let mut spans = vec![Span::styled(
+                    "   ",
+                    if selected {
+                        Style::default().bg(sel_bg)
+                    } else {
+                        Style::default()
+                    },
+                )]; // Indent
 
                 if revision.is_working_copy {
-                    spans.push(Span::styled(
-                        "@ ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    let mut style = Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD);
+                    if let Some(bg) = bg {
+                        style = style.bg(bg);
+                    }
+                    spans.push(Span::styled("@ ", style));
                 }
 
-                // Add the colored display line spans, with bold if selected
+                // Add the colored display line spans
                 for span in revision.display_line.spans.iter() {
                     let mut style = span.style;
-                    if selected {
-                        style = style.add_modifier(Modifier::BOLD);
+                    if let Some(bg) = bg {
+                        style = style.bg(bg);
                     }
                     spans.push(Span::styled(span.content.clone(), style));
                 }
