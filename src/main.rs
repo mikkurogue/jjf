@@ -1,78 +1,93 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Direction, Layout},
     prelude::*,
     style::{Color, Modifier, Style},
-    text::Line,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
 use std::{io::stdout, process::Command};
 
 mod ansi;
 mod jj;
 
-use jj::LogEntry;
+use jj::{Bookmark, TreeItem};
 
 #[derive(Parser)]
 #[command(name = "jjf")]
 #[command(about = "Fuzzy finder for jujutsu (jj) revisions")]
 struct Cli {
-    /// Revset to show (default: ::@)
-    #[arg(default_value = "::@")]
-    revisions: String,
+    /// Number of ancestor revisions to show per bookmark
+    #[arg(short, long, default_value = "5")]
+    depth: usize,
 
-    /// Maximum number of revisions to show
-    #[arg(short = 'n', long, default_value = "100")]
-    limit: usize,
+    /// Print tree structure without launching TUI (for debugging)
+    #[arg(long)]
+    debug: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Search,
+    List,
+}
+
+/// What action to take on selection
+#[derive(Clone)]
+enum Action {
+    New(String),  // jj new <target>
+    Edit(String), // jj edit <target>
 }
 
 struct App {
-    entries: Vec<LogEntry>,
+    bookmarks: Vec<Bookmark>,
+    tree_items: Vec<TreeItem>,
     filtered_indices: Vec<usize>,
     list_state: ListState,
     input: String,
-    preview_content: Vec<Line<'static>>,
-    preview_scroll: u16,
+    focus: Focus,
     should_quit: bool,
-    selected_change_id: Option<String>,
+    action: Option<Action>,
 }
 
 impl App {
-    fn new(entries: Vec<LogEntry>) -> Self {
-        let filtered_indices: Vec<usize> = (0..entries.len()).collect();
+    fn new(bookmarks: Vec<Bookmark>) -> Self {
+        let tree_items = jj::flatten_tree(&bookmarks);
+        let filtered_indices: Vec<usize> = (0..tree_items.len()).collect();
+
         let mut app = App {
-            entries,
+            bookmarks,
+            tree_items,
             filtered_indices,
             list_state: ListState::default(),
             input: String::new(),
-            preview_content: Vec::new(),
-            preview_scroll: 0,
+            focus: Focus::Search,
             should_quit: false,
-            selected_change_id: None,
+            action: None,
         };
+
         if !app.filtered_indices.is_empty() {
             app.list_state.select(Some(0));
-            app.update_preview();
         }
         app
     }
 
+    fn rebuild_tree(&mut self) {
+        self.tree_items = jj::flatten_tree(&self.bookmarks);
+        self.filter_entries();
+    }
+
     fn filter_entries(&mut self) {
         if self.input.is_empty() {
-            self.filtered_indices = (0..self.entries.len()).collect();
+            self.filtered_indices = (0..self.tree_items.len()).collect();
         } else {
-            let haystacks: Vec<&str> = self
-                .entries
-                .iter()
-                .map(|e| e.search_text.as_str())
-                .collect();
+            let haystacks: Vec<&str> = self.tree_items.iter().map(|e| e.search_text()).collect();
             let matches = frizbee::match_list(&self.input, &haystacks, &frizbee::Config::default());
             self.filtered_indices = matches.into_iter().map(|m| m.index as usize).collect();
         }
@@ -82,37 +97,6 @@ impl App {
             self.list_state.select(None);
         } else {
             self.list_state.select(Some(0));
-        }
-        self.update_preview();
-    }
-
-    fn update_preview(&mut self) {
-        let Some(selected) = self.list_state.selected() else {
-            self.preview_content = vec![Line::from("No revision selected")];
-            return;
-        };
-
-        let Some(&entry_idx) = self.filtered_indices.get(selected) else {
-            self.preview_content = vec![Line::from("No revision selected")];
-            return;
-        };
-
-        let entry = &self.entries[entry_idx];
-        let change_id = &entry.change_id;
-
-        // Run jj diff for this revision
-        let output = Command::new("jj")
-            .args(["diff", "-r", change_id, "--color=always"])
-            .output();
-
-        match output {
-            Ok(output) => {
-                let content = String::from_utf8_lossy(&output.stdout);
-                self.preview_content = ansi::parse_ansi_to_lines(&content);
-            }
-            Err(e) => {
-                self.preview_content = vec![Line::from(format!("Error running jj diff: {}", e))];
-            }
         }
     }
 
@@ -130,25 +114,101 @@ impl App {
         };
 
         self.list_state.select(Some(new_index));
-        self.preview_scroll = 0; // Reset scroll when changing selection
-        self.update_preview();
     }
 
-    fn scroll_preview(&mut self, delta: i16) {
-        if delta > 0 {
-            self.preview_scroll = self.preview_scroll.saturating_add(delta as u16);
-        } else {
-            self.preview_scroll = self.preview_scroll.saturating_sub((-delta) as u16);
-        }
-        // Clamp to content length
-        let max_scroll = self.preview_content.len().saturating_sub(1) as u16;
-        self.preview_scroll = self.preview_scroll.min(max_scroll);
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Search => Focus::List,
+            Focus::List => Focus::Search,
+        };
     }
 
-    fn confirm_selection(&mut self) {
+    fn get_selected_item(&self) -> Option<&TreeItem> {
+        let selected = self.list_state.selected()?;
+        let &idx = self.filtered_indices.get(selected)?;
+        self.tree_items.get(idx)
+    }
+
+    fn toggle_expand(&mut self) {
         if let Some(selected) = self.list_state.selected() {
-            if let Some(&entry_idx) = self.filtered_indices.get(selected) {
-                self.selected_change_id = Some(self.entries[entry_idx].change_id.clone());
+            if let Some(&idx) = self.filtered_indices.get(selected) {
+                if let Some(item) = self.tree_items.get(idx) {
+                    if let TreeItem::BookmarkHeader { bookmark_idx, .. } = item {
+                        self.bookmarks[*bookmark_idx].expanded =
+                            !self.bookmarks[*bookmark_idx].expanded;
+                        self.rebuild_tree();
+                    }
+                }
+            }
+        }
+    }
+
+    fn expand_selected(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if let Some(&idx) = self.filtered_indices.get(selected) {
+                if let Some(item) = self.tree_items.get(idx) {
+                    if let TreeItem::BookmarkHeader { bookmark_idx, .. } = item {
+                        if !self.bookmarks[*bookmark_idx].expanded {
+                            self.bookmarks[*bookmark_idx].expanded = true;
+                            self.rebuild_tree();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collapse_selected(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if let Some(&idx) = self.filtered_indices.get(selected) {
+                if let Some(item) = self.tree_items.get(idx) {
+                    match item {
+                        TreeItem::BookmarkHeader { bookmark_idx, .. } => {
+                            if self.bookmarks[*bookmark_idx].expanded {
+                                self.bookmarks[*bookmark_idx].expanded = false;
+                                self.rebuild_tree();
+                            }
+                        }
+                        TreeItem::Revision { bookmark_idx, .. } => {
+                            // Collapse parent bookmark and move selection to it
+                            let bi = *bookmark_idx;
+                            self.bookmarks[bi].expanded = false;
+                            self.rebuild_tree();
+                            // Find the bookmark header in the new list
+                            for (i, item) in self.tree_items.iter().enumerate() {
+                                if let TreeItem::BookmarkHeader {
+                                    bookmark_idx: idx, ..
+                                } = item
+                                {
+                                    if *idx == bi {
+                                        self.list_state.select(Some(i));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn do_new(&mut self) {
+        if let Some(item) = self.get_selected_item().cloned() {
+            let target = match &item {
+                TreeItem::BookmarkHeader { name, .. } => name.clone(),
+                TreeItem::Revision { revision, .. } => revision.change_id.clone(),
+            };
+            self.action = Some(Action::New(target));
+            self.should_quit = true;
+        }
+    }
+
+    fn do_edit(&mut self) {
+        if let Some(item) = self.get_selected_item().cloned() {
+            // Can only edit revisions, not bookmarks
+            if let TreeItem::Revision { revision, .. } = &item {
+                self.action = Some(Action::Edit(revision.change_id.clone()));
                 self.should_quit = true;
             }
         }
@@ -158,12 +218,26 @@ impl App {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Get jj log entries
-    let entries =
-        jj::get_log_entries(&cli.revisions, cli.limit).context("Failed to get jj log entries")?;
+    // Get bookmarks with their revisions
+    let bookmarks = jj::get_bookmarks(cli.depth).context("Failed to get bookmarks")?;
 
-    if entries.is_empty() {
-        eprintln!("No revisions found for revset: {}", cli.revisions);
+    if bookmarks.is_empty() {
+        eprintln!("No bookmarks found in this repository");
+        return Ok(());
+    }
+
+    // Debug mode: print tree without TUI
+    if cli.debug {
+        for bookmark in &bookmarks {
+            println!("▶ {}", bookmark.name);
+            for rev in &bookmark.revisions {
+                let wc = if rev.is_working_copy { "@ " } else { "  " };
+                println!(
+                    "   {}{} {} {}",
+                    wc, rev.change_id, rev.commit_id, rev.description
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -173,7 +247,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Create and run app
-    let mut app = App::new(entries);
+    let mut app = App::new(bookmarks);
     let result = run_app(&mut terminal, &mut app);
 
     // Restore terminal
@@ -182,15 +256,31 @@ fn main() -> Result<()> {
 
     result?;
 
-    // Execute jj new if a selection was made
-    if let Some(change_id) = app.selected_change_id {
-        let status = Command::new("jj")
-            .args(["new", &change_id])
-            .status()
-            .context("Failed to execute jj new")?;
+    // Execute action if one was selected
+    if let Some(action) = app.action {
+        match action {
+            Action::New(target) => {
+                let status = Command::new("jj")
+                    .args(["new", &target])
+                    .status()
+                    .context("Failed to execute jj new")?;
 
-        if !status.success() {
-            anyhow::bail!("jj new failed with status: {}", status);
+                if !status.success() {
+                    anyhow::bail!("jj new failed with status: {}", status);
+                }
+                println!("Created new revision on {}", target);
+            }
+            Action::Edit(target) => {
+                let status = Command::new("jj")
+                    .args(["edit", &target])
+                    .status()
+                    .context("Failed to execute jj edit")?;
+
+                if !status.success() {
+                    anyhow::bail!("jj edit failed with status: {}", status);
+                }
+                println!("Now editing {}", target);
+            }
         }
     }
 
@@ -213,58 +303,90 @@ fn run_app(
                 continue;
             }
 
+            // Global keybindings
             match key.code {
                 KeyCode::Esc => {
                     app.should_quit = true;
+                    continue;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.should_quit = true;
+                    continue;
                 }
-                KeyCode::Enter => {
-                    app.confirm_selection();
-                }
-                // Navigation: Ctrl+j/k or Up/Down arrows
-                KeyCode::Up => {
-                    app.move_selection(-1);
-                }
-                KeyCode::Down => {
-                    app.move_selection(1);
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.move_selection(-1);
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.move_selection(1);
-                }
-                KeyCode::Tab => {
-                    app.move_selection(1);
-                }
-                KeyCode::BackTab => {
-                    app.move_selection(-1);
-                }
-                KeyCode::PageUp => {
-                    app.move_selection(-10);
-                }
-                KeyCode::PageDown => {
-                    app.move_selection(10);
-                }
-                // Preview scrolling with Ctrl+u/d
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_preview(-10);
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_preview(10);
-                }
-                // Text input
-                KeyCode::Char(c) => {
-                    app.input.push(c);
-                    app.filter_entries();
-                }
-                KeyCode::Backspace => {
-                    app.input.pop();
-                    app.filter_entries();
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.toggle_focus();
+                    continue;
                 }
                 _ => {}
+            }
+
+            // Focus-specific keybindings
+            match app.focus {
+                Focus::Search => match key.code {
+                    KeyCode::Char(c) => {
+                        app.input.push(c);
+                        app.filter_entries();
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                        app.filter_entries();
+                    }
+                    KeyCode::Down | KeyCode::Enter => {
+                        app.focus = Focus::List;
+                    }
+                    _ => {}
+                },
+                Focus::List => match key.code {
+                    // Vim bindings
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.move_selection(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.move_selection(-1);
+                    }
+                    KeyCode::Char('g') => {
+                        app.list_state.select(Some(0));
+                    }
+                    KeyCode::Char('G') => {
+                        let len = app.filtered_indices.len();
+                        if len > 0 {
+                            app.list_state.select(Some(len - 1));
+                        }
+                    }
+                    // Expand/collapse
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        app.expand_selected();
+                    }
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        app.collapse_selected();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        // Toggle expand on bookmark only
+                        if let Some(item) = app.get_selected_item() {
+                            if item.is_bookmark() {
+                                app.toggle_expand();
+                            }
+                        }
+                    }
+                    // Actions
+                    KeyCode::Char('n') => {
+                        app.do_new();
+                    }
+                    KeyCode::Char('e') => {
+                        app.do_edit();
+                    }
+                    // Switch back to search
+                    KeyCode::Char('/') => {
+                        app.focus = Focus::Search;
+                    }
+                    KeyCode::PageUp => {
+                        app.move_selection(-10);
+                    }
+                    KeyCode::PageDown => {
+                        app.move_selection(10);
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -275,62 +397,69 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Input
-            Constraint::Min(0),    // Main content
+            Constraint::Min(0),    // List
             Constraint::Length(1), // Help line
         ])
         .split(f.area());
 
     // Input box
-    let input_block = Block::default().borders(Borders::ALL).title(" Search ");
-    let input = Paragraph::new(format!("> {}", app.input))
+    let search_style = if app.focus == Focus::Search {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(search_style)
+        .title(" Search ");
+    let cursor_char = if app.focus == Focus::Search { "_" } else { "" };
+    let input = Paragraph::new(format!("> {}{}", app.input, cursor_char))
         .block(input_block)
-        .style(Style::default().fg(Color::Yellow));
+        .style(Style::default().fg(Color::White));
     f.render_widget(input, chunks[0]);
 
-    // Split main area into list and preview
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40), // List
-            Constraint::Percentage(60), // Preview
-        ])
-        .split(chunks[1]);
+    // Tree list
+    let list_style = if app.focus == Focus::List {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
-    // Revision list
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
         .map(|&idx| {
-            let entry = &app.entries[idx];
-            ListItem::new(entry.display_lines.clone())
+            let item = &app.tree_items[idx];
+            ListItem::new(item.to_display_line())
         })
         .collect();
 
-    let list_title = format!(
-        " Revisions ({}/{}) ",
-        app.filtered_indices.len(),
-        app.entries.len()
-    );
+    let list_title = format!(" Bookmarks ({}) ", app.bookmarks.len(),);
+
+    // Use underline instead of reverse for highlight
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(list_title))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(list, main_chunks[0], &mut app.list_state.clone());
-
-    // Preview pane with scrolling
-    let preview = Paragraph::new(app.preview_content.clone())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Preview (jj diff) "),
+                .border_style(list_style)
+                .title(list_title),
         )
-        .scroll((app.preview_scroll, 0));
-    f.render_widget(preview, main_chunks[1]);
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+        )
+        .highlight_symbol("› ");
 
-    // Help line
-    let help =
-        Paragraph::new(" Enter: select | Esc: quit | Tab/↑↓: navigate | Ctrl+u/d: scroll preview")
-            .style(Style::default().fg(Color::DarkGray));
+    f.render_stateful_widget(list, chunks[1], &mut app.list_state.clone());
+
+    // Help line - context-sensitive
+    let help_text = match app.focus {
+        Focus::Search => " Tab: list | Type to filter | Enter/↓: go to list",
+        Focus::List => {
+            " j/k: move | l/h: expand/collapse | n: new | e: edit | Enter: toggle/select | /: search"
+        }
+    };
+    let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(help, chunks[2]);
 }
